@@ -160,10 +160,6 @@ public class FileDownloadUtils {
             FSDataInputStream inputStream = fileSystem.open(remoteFilePath);
             closeableRegistry.registerCloseable(inputStream);
 
-            if (closeableRegistry.isClosed()) {
-                throw new IOException("Download was cancelled.");
-            }
-
             Files.createDirectories(targetFilePath.getParent());
 
             if (closeableRegistry.isClosed()) {
@@ -172,10 +168,6 @@ public class FileDownloadUtils {
 
             OutputStream outputStream = Files.newOutputStream(targetFilePath);
             closeableRegistry.registerCloseable(outputStream);
-
-            if (closeableRegistry.isClosed()) {
-                throw new IOException("Download was cancelled.");
-            }
 
             long readBytes = IOUtils.copyBytes(inputStream, outputStream, false);
 

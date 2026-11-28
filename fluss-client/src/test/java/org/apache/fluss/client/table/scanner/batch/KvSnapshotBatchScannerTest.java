@@ -18,6 +18,7 @@
 package org.apache.fluss.client.table.scanner.batch;
 
 import org.apache.fluss.client.table.scanner.RemoteFileDownloader;
+import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.fs.FSDataInputStream;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
@@ -43,7 +44,9 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for {@link KvSnapshotBatchScanner}. */
@@ -133,17 +136,28 @@ class KvSnapshotBatchScannerTest {
     }
 
     @Test
-    void testClosingScannerWaitsForDownloadWorkerInitialization(@TempDir Path tempDir)
+    void testClosingScannerDefersCleanupUntilDownloadWorkerStops(@TempDir Path tempDir)
             throws Exception {
         CountDownLatch openStarted = new CountDownLatch(1);
-        CountDownLatch inputCloseStarted = new CountDownLatch(1);
-        CountDownLatch releaseInputClose = new CountDownLatch(1);
+        CountDownLatch releaseOpen = new CountDownLatch(1);
 
         FileSystem fileSystem =
                 new LocalFileSystem() {
                     @Override
                     public FSDataInputStream open(FsPath path) {
                         openStarted.countDown();
+                        boolean interrupted = false;
+                        while (true) {
+                            try {
+                                releaseOpen.await();
+                                break;
+                            } catch (InterruptedException e) {
+                                interrupted = true;
+                            }
+                        }
+                        if (interrupted) {
+                            Thread.currentThread().interrupt();
+                        }
                         return new FSDataInputStream() {
                             @Override
                             public int read() {
@@ -151,21 +165,7 @@ class KvSnapshotBatchScannerTest {
                             }
 
                             @Override
-                            public void close() {
-                                inputCloseStarted.countDown();
-                                boolean interrupted = false;
-                                while (true) {
-                                    try {
-                                        releaseInputClose.await();
-                                        break;
-                                    } catch (InterruptedException e) {
-                                        interrupted = true;
-                                    }
-                                }
-                                if (interrupted) {
-                                    Thread.currentThread().interrupt();
-                                }
-                            }
+                            public void close() {}
 
                             @Override
                             public void seek(long desired) {}
@@ -205,12 +205,35 @@ class KvSnapshotBatchScannerTest {
         try {
             assertThat(openStarted.await(10, TimeUnit.SECONDS)).isTrue();
             closeThread.start();
-            assertThat(inputCloseStarted.await(10, TimeUnit.SECONDS)).isTrue();
-            releaseInputClose.countDown();
+            waitUntil(
+                    () -> closeThread.getState() == Thread.State.TIMED_WAITING,
+                    Duration.ofSeconds(10),
+                    "Scanner close did not enter its bounded wait");
+            assertThat(closeThread.isAlive()).isTrue();
             closeThread.join(TimeUnit.SECONDS.toMillis(10));
             assertThat(closeThread.isAlive()).isFalse();
+            assertThat(
+                            tempDir.toFile()
+                                    .listFiles(
+                                            (dir, name) ->
+                                                    name.startsWith("kv-snapshots-")
+                                                            && new File(dir, name).isDirectory()))
+                    .hasSize(1);
+            releaseOpen.countDown();
+            waitUntil(
+                    () ->
+                            tempDir.toFile()
+                                            .listFiles(
+                                                    (dir, name) ->
+                                                            name.startsWith("kv-snapshots-")
+                                                                    && new File(dir, name)
+                                                                            .isDirectory())
+                                            .length
+                                    == 0,
+                    Duration.ofSeconds(10),
+                    "Snapshot directory was not removed after download worker stopped");
         } finally {
-            releaseInputClose.countDown();
+            releaseOpen.countDown();
             scanner.close();
             downloader.close();
         }
@@ -222,5 +245,77 @@ class KvSnapshotBatchScannerTest {
                                                 name.startsWith("kv-snapshots-")
                                                         && new File(dir, name).isDirectory()))
                 .isEmpty();
+    }
+
+    @Test
+    void testPollBatchReportsDownloadFailure(@TempDir Path tempDir) throws Exception {
+        CountDownLatch downloadStarted = new CountDownLatch(1);
+        CountDownLatch failDownload = new CountDownLatch(1);
+        RemoteFileDownloader failingDownloader =
+                new RemoteFileDownloader(1) {
+                    @Override
+                    public void transferAllToDirectory(
+                            List<FsPathAndFileName> fsPathAndFileNames,
+                            Path targetDirectory,
+                            CloseableRegistry closeableRegistry)
+                            throws IOException {
+                        downloadStarted.countDown();
+                        try {
+                            failDownload.await();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new IOException("Download interrupted", e);
+                        }
+                        throw new IOException("Injected download failure");
+                    }
+                };
+        FsPath remotePath = new FsPath(tempDir.resolve("dummy-remote-file").toUri());
+        List<FsPathAndFileName> files =
+                Collections.singletonList(new FsPathAndFileName(remotePath, "file.sst"));
+        KvSnapshotBatchScanner scanner =
+                new KvSnapshotBatchScanner(
+                        1,
+                        SCHEMA,
+                        new TestingSchemaGetter(1, SCHEMA),
+                        new TableBucket(1L, 0),
+                        files,
+                        null,
+                        tempDir.toString(),
+                        KvValueLayout.PLAIN,
+                        KvFormat.COMPACTED,
+                        failingDownloader);
+        CountDownLatch pollStarted = new CountDownLatch(1);
+        AtomicReference<Exception> pollFailure = new AtomicReference<>();
+        Thread pollThread =
+                new Thread(
+                        () -> {
+                            pollStarted.countDown();
+                            try {
+                                scanner.pollBatch(Duration.ofSeconds(10));
+                            } catch (Exception e) {
+                                pollFailure.set(e);
+                            }
+                        });
+
+        try {
+            assertThat(downloadStarted.await(10, TimeUnit.SECONDS)).isTrue();
+            pollThread.start();
+            assertThat(pollStarted.await(10, TimeUnit.SECONDS)).isTrue();
+            waitUntil(
+                    () -> pollThread.getState() == Thread.State.TIMED_WAITING,
+                    Duration.ofSeconds(10),
+                    "pollBatch did not wait for snapshot reader initialization");
+            failDownload.countDown();
+            pollThread.join(TimeUnit.SECONDS.toMillis(10));
+            assertThat(pollThread.isAlive()).isFalse();
+            assertThat(pollFailure.get())
+                    .isInstanceOf(FlussRuntimeException.class)
+                    .hasMessageContaining("Failed to initialize snapshot files reader.")
+                    .hasCauseInstanceOf(IOException.class);
+        } finally {
+            failDownload.countDown();
+            scanner.close();
+            failingDownloader.close();
+        }
     }
 }

@@ -45,7 +45,6 @@ import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -73,6 +72,7 @@ import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 public class KvSnapshotBatchScanner implements BatchScanner {
 
     private static final Logger LOG = LoggerFactory.getLogger(KvSnapshotBatchScanner.class);
+    private static final long INIT_SHUTDOWN_TIMEOUT_SECONDS = 1;
 
     public static final CloseableIterator<InternalRow> NO_DATA_AVAILABLE =
             CloseableIterator.emptyIterator();
@@ -101,7 +101,7 @@ public class KvSnapshotBatchScanner implements BatchScanner {
     private final ExecutorService initExecutor =
             Executors.newSingleThreadExecutor(
                     new ExecutorThreadFactory("fluss-kv-snapshot-scanner-init"));
-    private volatile CompletableFuture<Void> initFuture;
+    private final AtomicBoolean initFinished = new AtomicBoolean(false);
 
     private volatile SnapshotFilesReader snapshotFilesReader;
 
@@ -162,7 +162,11 @@ public class KvSnapshotBatchScanner implements BatchScanner {
                                 return NO_DATA_AVAILABLE;
                             }
                         }
+                        ensureNoException();
                         if (closed.get()) {
+                            return NO_DATA_AVAILABLE;
+                        }
+                        if (snapshotFilesReader == null) {
                             return NO_DATA_AVAILABLE;
                         }
                         return snapshotFilesReader.hasNext() ? snapshotFilesReader : null;
@@ -194,95 +198,85 @@ public class KvSnapshotBatchScanner implements BatchScanner {
                 lock,
                 () -> {
                     if (closed.compareAndSet(false, true)) {
-                        // Cancel background downloading tasks and abort active download streams.
-                        IOUtils.closeQuietly(downloadCloseableRegistry);
-                        if (initFuture != null) {
-                            initFuture.cancel(true);
-                        }
+                        // Interrupt initialization; FileDownloadUtils closes its download streams.
                         initExecutor.shutdownNow();
                         IOUtils.closeQuietly(snapshotFilesReader);
                         readerIsReady.signalAll();
                     }
                 });
-        boolean interrupted = false;
-        while (!initExecutor.isTerminated()) {
-            try {
-                initExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
-            } catch (InterruptedException e) {
-                interrupted = true;
-            }
-        }
-        FileUtils.deleteDirectoryQuietly(snapshotLocalDirectory.toFile());
-        if (interrupted) {
+        try {
+            initExecutor.awaitTermination(INIT_SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+        if (initFinished.get()) {
+            FileUtils.deleteDirectoryQuietly(snapshotLocalDirectory.toFile());
         }
     }
 
     private void initReaderAsynchronously() {
-        initFuture =
-                CompletableFuture.runAsync(
-                        () -> {
+        initExecutor.execute(
+                () -> {
+                    try {
+                        if (closed.get()) {
+                            return;
+                        }
+                        try {
+                            if (!snapshotLocalDirectory.toFile().mkdirs()) {
+                                throw new IOException(
+                                        String.format(
+                                                "Failed to create directory %s for storing kv snapshot files.",
+                                                snapshotLocalDirectory));
+                            }
                             if (closed.get()) {
                                 return;
                             }
-                            try {
-                                if (!snapshotLocalDirectory.toFile().mkdirs()) {
-                                    throw new IOException(
-                                            String.format(
-                                                    "Failed to create directory %s for storing kv snapshot files.",
-                                                    snapshotLocalDirectory));
-                                }
-                                if (closed.get()) {
-                                    FileUtils.deleteDirectoryQuietly(
-                                            snapshotLocalDirectory.toFile());
-                                    return;
-                                }
-                                LOG.info(
-                                        "Start to download kv snapshot files to local directory for bucket {}.",
-                                        tableBucket);
-                                long startTime = System.currentTimeMillis();
-                                remoteFileDownloader.transferAllToDirectory(
-                                        fsPathAndFileNames,
-                                        snapshotLocalDirectory,
-                                        downloadCloseableRegistry);
-                                LOG.info(
-                                        "Download kv snapshot files to local directory for bucket {} cost {} ms.",
-                                        tableBucket,
-                                        System.currentTimeMillis() - startTime);
+                            LOG.info(
+                                    "Start to download kv snapshot files to local directory for bucket {}.",
+                                    tableBucket);
+                            long startTime = System.currentTimeMillis();
+                            remoteFileDownloader.transferAllToDirectory(
+                                    fsPathAndFileNames,
+                                    snapshotLocalDirectory,
+                                    downloadCloseableRegistry);
+                            LOG.info(
+                                    "Download kv snapshot files to local directory for bucket {} cost {} ms.",
+                                    tableBucket,
+                                    System.currentTimeMillis() - startTime);
 
-                                inLock(
-                                        lock,
-                                        () -> {
-                                            if (closed.get()) {
-                                                return;
-                                            }
-                                            snapshotFilesReader =
-                                                    new SnapshotFilesReader(
-                                                            kvFormat,
-                                                            snapshotLocalDirectory,
-                                                            projectedFields,
-                                                            targetSchemaId,
-                                                            targetSchema,
-                                                            schemaGetter,
-                                                            kvValueLayout);
+                            inLock(
+                                    lock,
+                                    () -> {
+                                        if (closed.get()) {
+                                            return;
+                                        }
+                                        snapshotFilesReader =
+                                                new SnapshotFilesReader(
+                                                        kvFormat,
+                                                        snapshotLocalDirectory,
+                                                        projectedFields,
+                                                        targetSchemaId,
+                                                        targetSchema,
+                                                        schemaGetter,
+                                                        kvValueLayout);
+                                        readerIsReady.signalAll();
+                                    });
+                        } catch (Throwable e) {
+                            inLock(
+                                    lock,
+                                    () -> {
+                                        if (!closed.get()) {
+                                            initSnapshotFilesReaderException = e;
                                             readerIsReady.signalAll();
-                                        });
-                            } catch (Throwable e) {
-                                if (closed.get()) {
-                                    FileUtils.deleteDirectoryQuietly(
-                                            snapshotLocalDirectory.toFile());
-                                    return;
-                                }
-                                inLock(
-                                        lock,
-                                        () -> {
-                                            if (!closed.get()) {
-                                                initSnapshotFilesReaderException = e;
-                                                readerIsReady.signalAll();
-                                            }
-                                        });
-                            }
-                        },
-                        initExecutor);
+                                        }
+                                    });
+                        }
+                    } finally {
+                        initFinished.set(true);
+                        if (closed.get() || initSnapshotFilesReaderException != null) {
+                            FileUtils.deleteDirectoryQuietly(snapshotLocalDirectory.toFile());
+                        }
+                    }
+                });
     }
 }
